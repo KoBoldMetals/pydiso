@@ -8,7 +8,9 @@ from pydiso.mkl_solver import (
     set_mkl_threads,
     set_mkl_pardiso_threads,
 )
+from concurrent.futures import ThreadPoolExecutor
 import pytest
+import sys
 
 np.random.seed(12345)
 n = 40
@@ -39,6 +41,7 @@ A_complex_dict = {'complex_structurally_symmetric': Lc@Uc,
                   }
 
 
+@pytest.mark.xfail(sys.platform == "darwin", reason="Unexpected Thread bug in third party library")
 def test_thread_setting():
     n1 = get_mkl_max_threads()
     n2 = get_mkl_pardiso_max_threads()
@@ -93,8 +96,22 @@ def test_solver(A, matrix_type):
     x2 = solver.solve(b)
 
     eps = np.finfo(dtype).eps
-    rel_err = np.linalg.norm(x-x2)/np.linalg.norm(x)
-    assert rel_err < 1E3*eps
+    np.testing.assert_allclose(x, x2, atol=1E3*eps)
+
+@pytest.mark.parametrize("A, matrix_type", inputs)
+def test_transpose_solver(A, matrix_type):
+    dtype = A.dtype
+    if np.issubdtype(dtype, np.complexfloating):
+        x = xc.astype(dtype)
+    else:
+        x = xr.astype(dtype)
+    b = A.T @ x
+
+    solver = Solver(A, matrix_type=matrix_type)
+    x2 = solver.solve(b, transpose=True)
+
+    eps = np.finfo(dtype).eps
+    np.testing.assert_allclose(x, x2, atol=1E3*eps)
 
 def test_multiple_RHS():
     A = A_real_dict["real_symmetric_positive_definite"]
@@ -105,8 +122,7 @@ def test_multiple_RHS():
     x2 = solver.solve(b)
 
     eps = np.finfo(np.float64).eps
-    rel_err = np.linalg.norm(x-x2)/np.linalg.norm(x)
-    assert rel_err < 1E3*eps
+    np.testing.assert_allclose(x, x2, atol=1E3*eps)
 
 
 def test_matrix_type_errors():
@@ -117,6 +133,7 @@ def test_matrix_type_errors():
     A = A_complex_dict["complex_structurally_symmetric"]
     with pytest.raises(TypeError):
         solver = Solver(A, matrix_type="real_symmetric_positive_definite")
+
 
 
 def test_rhs_size_error():
@@ -131,3 +148,25 @@ def test_rhs_size_error():
         solver.solve(b_bad)
     with pytest.raises(ValueError):
         solver.solve(b, x_bad)
+
+def test_threading():
+    """
+    Here we test that calling the solver is safe from multiple threads.
+    There isn't actually any speedup because it acquires a lock on each call
+    to pardiso internally (because those calls are not thread safe).
+    """
+    n = 200
+    n_rhs = 75
+    A = sp.diags([-1, 2, -1], (-1, 0, 1), shape=(n, n), format='csr')
+    Ainv = Solver(A)
+
+    x_true = np.random.rand(n, n_rhs)
+    rhs = A @ x_true
+
+    with ThreadPoolExecutor() as pool:
+        x_sol = np.stack(
+            list(pool.map(lambda i: Ainv.solve(rhs[:, i]), range(n_rhs))),
+            axis=1
+        )
+
+    np.testing.assert_allclose(x_true, x_sol)

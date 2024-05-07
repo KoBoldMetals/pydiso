@@ -1,16 +1,24 @@
 #cython: language_level=3
-#cython: linetrace=True
 cimport numpy as np
+import cython
 from cython cimport numeric
+from cpython.pythread cimport (
+    PyThread_type_lock,
+    PyThread_allocate_lock,
+    PyThread_acquire_lock,
+    PyThread_release_lock,
+    PyThread_free_lock
+)
 
 import warnings
 import numpy as np
 import scipy.sparse as sp
 import os
 
-ctypedef long long MKL_INT64
-ctypedef unsigned long long MKL_UINT64
-ctypedef int MKL_INT
+cdef extern from 'mkl.h':
+    ctypedef long long MKL_INT64
+    ctypedef unsigned long long MKL_UINT64
+    ctypedef int MKL_INT
 
 ctypedef MKL_INT int_t
 ctypedef MKL_INT64 long_t
@@ -34,28 +42,31 @@ cdef extern from 'mkl.h':
     int mkl_get_max_threads()
     int mkl_domain_get_max_threads(int domain)
 
-    ctypedef int (*ProgressEntry)(int_t* thread, int_t* step, char* stage, int_t stage_len) except? -1;
+    ctypedef int (*ProgressEntry)(int* thread, int* step, char* stage, int stage_len) except? -1;
     ProgressEntry mkl_set_progress(ProgressEntry progress);
 
     ctypedef void * _MKL_DSS_HANDLE_t
 
-    void pardiso(_MKL_DSS_HANDLE_t, const int*, const int*, const int*,
-                 const int *, const int *, const void *, const int *,
-                 const int *, int *, const int *, int *,
-                 const int *, void *, void *, int *)
+    void pardiso(_MKL_DSS_HANDLE_t, const int_t*, const int_t*, const int_t*,
+                 const int_t *, const int_t *, const void *, const int_t *,
+                 const int_t *, int_t *, const int_t *, int_t *,
+                 const int_t *, void *, void *, int_t *) nogil
 
     void pardiso_64(_MKL_DSS_HANDLE_t, const long_t *, const long_t *, const long_t *,
                     const long_t *, const long_t *, const void *, const long_t *,
                     const long_t *, long_t *, const long_t *, long_t *,
-                    const long_t *, void *, void *, long_t *)
+                    const long_t *, void *, void *, long_t *) nogil
 
 
 #call pardiso (pt, maxfct, mnum, mtype, phase, n, a, ia, ja, perm, nrhs, iparm, msglvl, b, x, error)
-cdef int mkl_progress(int_t *thread, int_t* step, char* stage, int_t stage_len):
-    print(thread[0], step[0], stage, stage_len)
+cdef int mkl_progress(int *thread, int* step, char* stage, int stage_len) nogil:
+    # must be a nogil process to pass to mkl pardiso progress reporting
+    with gil:
+        # must reacquire the gil to print out back to python.
+        print(thread[0], step[0], stage, stage_len)
     return 0
 
-cdef int mkl_no_progress(int_t *thread, int_t* step, char* stage, int_t stage_len) nogil:
+cdef int mkl_no_progress(int *thread, int* step, char* stage, int stage_len) nogil:
     return 0
 
 MATRIX_TYPES ={
@@ -104,7 +115,7 @@ def _ensure_csr(A, sym=False):
         if sym and sp.isspmatrix_csc(A):
             A = A.T
         else:
-            warnings.warn("Converting %s matrix to CSR format, will slow down."
+            warnings.warn("Converting %s matrix to CSR format."
                          %A.__class__.__name__, PardisoTypeConversionWarning)
             A = A.tocsr()
     return A
@@ -183,12 +194,17 @@ cdef class MKLPardisoSolver:
     cdef int_t mat_type
     cdef int_t _factored
     cdef size_t shape[2]
-    cdef int_t _initialized
-
+    cdef PyThread_type_lock lock
     cdef void * a
 
     cdef object _data_type
-    cdef object _Adata #a reference to make sure the pointer "a" doesn't get destroyed
+    cdef object _Adata # a reference to make sure the pointer "a" doesn't get destroyed
+
+    def __cinit__(self, *args, **kwargs):
+        self.lock = PyThread_allocate_lock()
+
+        for i in range(64):
+            self.handle[i] = NULL
 
     def __init__(self, A, matrix_type=None, factor=True, verbose=False):
         '''ParidsoSolver(A, matrix_type=None, factor=True, verbose=False)
@@ -247,7 +263,6 @@ cdef class MKLPardisoSolver:
         >>> np.allclose(x, x_solved)
         True
         '''
-        self._initialized = False
         n_row, n_col = A.shape
         if n_row != n_col:
             raise ValueError("Matrix is not square")
@@ -285,18 +300,17 @@ cdef class MKLPardisoSolver:
 
         #set integer length
         integer_len = A.indices.itemsize
-        self._is_32 = integer_len == sizeof(int_t)
+        #self._is_32 = integer_len == sizeof(int_t)
+        self._is_32 = sizeof(int_t) == 8 or integer_len == sizeof(int_t)
+
         if self._is_32:
             self._par = _PardisoParams()
             self._initialize(self._par, A, matrix_type, verbose)
-        elif integer_len == 8:
+        else:
             self._par64 = _PardisoParams64()
             self._initialize(self._par64, A, matrix_type, verbose)
-        else:
-            raise PardisoError("Unrecognized integer length")
-        self._initialized = True
 
-        if(verbose):
+        if verbose:
             #for reporting factorization progress via python's `print`
             mkl_set_progress(mkl_progress)
         else:
@@ -333,10 +347,17 @@ cdef class MKLPardisoSolver:
         self._set_A(A.data)
         self._factor()
 
+    cdef _initialized(self):
+        cdef int i
+        for i in range(64):
+            if self.handle[i]:
+                return 1
+        return 0
+
     def __call__(self, b):
         return self.solve(b)
 
-    def solve(self, b, x=None):
+    def solve(self, b, x=None, transpose=False):
         """solve(self, b, x=None, transpose=False)
         Solves the equation AX=B using the factored A matrix
 
@@ -354,6 +375,8 @@ cdef class MKLPardisoSolver:
         x : numpy.ndarray, optional
             A pre-allocated output array (of the same data type as A).
             If None, a new array is constructed.
+        transpose : bool, optional
+            If True, it will solve A^TX=B using the factored A matrix.
 
         Returns
         -------
@@ -388,6 +411,10 @@ cdef class MKLPardisoSolver:
 
         cdef int_t nrhs = b.shape[1] if b.ndim == 2 else 1
 
+        if transpose:
+            self.set_iparm(11, 2)
+        else:
+            self.set_iparm(11, 0)
         self._solve(bp, xp, nrhs)
         return x
 
@@ -420,21 +447,29 @@ cdef class MKLPardisoSolver:
         if self._is_32:
             self._par.iparm[i] = val
         else:
-            self._par.iparm[i] = val
+            self._par64.iparm[i] = val
 
     @property
     def nnz(self):
         return self.iparm[17]
 
     cdef _initialize(self, _par_params par, A, matrix_type, verbose):
+
+        if _par_params is _PardisoParams:
+            int_dtype = f'i{sizeof(int_t)}'
+        else:
+            int_dtype = 'i8'
         par.n = A.shape[0]
-        par.perm = np.empty(par.n, dtype=np.int32)
+        par.perm = np.empty(par.n, dtype=int_dtype)
 
         par.maxfct = 1
         par.mnum = 1
 
         par.mtype = matrix_type
         par.msglvl = verbose
+
+        for i in range(64):
+            par.iparm[i] = 0  # ensure these all start at 0
 
         # set default parameters
         par.iparm[0] = 1  # tell pardiso to not reset these values on the first call
@@ -470,15 +505,8 @@ cdef class MKLPardisoSolver:
         par.iparm[55] = 0  # Internal function used to work with pivot and calculation of diagonal arrays turned off.
         par.iparm[59] = 0  # operate in-core mode
 
-        if _par_params is _PardisoParams:
-            indices = np.require(A.indices, dtype=np.int32)
-            indptr = np.require(A.indptr, dtype=np.int32)
-        else:
-            indices = np.require(A.indices, dtype=np.int64)
-            indptr = np.require(A.indptr, dtype=np.int64)
-
-        par.ia = indptr
-        par.ja = indices
+        par.ia = np.require(A.indptr, dtype=int_dtype)
+        par.ja = np.require(A.indices, dtype=int_dtype)
 
     cdef _set_A(self, data):
         self._Adata = data
@@ -489,26 +517,36 @@ cdef class MKLPardisoSolver:
         cdef int_t phase=-1, nrhs=0, error=0
         cdef long_t phase64=-1, nrhs64=0, error64=0
 
-        if self._initialized:
-            if self._is_32:
-                pardiso(
-                    self.handle, &self._par.maxfct, &self._par.mnum, &self._par.mtype,
-                    &phase, &self._par.n, self.a, NULL, NULL, NULL, &nrhs, self._par.iparm,
-                    &self._par.msglvl, NULL, NULL, &error
-                )
-            else:
-                pardiso_64(
-                    self.handle, &self._par64.maxfct, &self._par64.mnum, &self._par64.mtype,
-                    &phase64, &self._par64.n, self.a, NULL, NULL, NULL, &nrhs64,
-                    self._par64.iparm, &self._par64.msglvl, NULL, NULL, &error64
-                )
+        if self._initialized():
+            with nogil:
+                PyThread_acquire_lock(self.lock, 1)
+                if self._is_32:
+                    pardiso(
+                        self.handle, &self._par.maxfct, &self._par.mnum, &self._par.mtype,
+                        &phase, &self._par.n, NULL, NULL, NULL, NULL, &nrhs, self._par.iparm,
+                        &self._par.msglvl, NULL, NULL, &error
+                    )
+                else:
+                    pardiso_64(
+                        self.handle, &self._par64.maxfct, &self._par64.mnum, &self._par64.mtype,
+                        &phase64, &self._par64.n, NULL, NULL, NULL, NULL, &nrhs64,
+                        self._par64.iparm, &self._par64.msglvl, NULL, NULL, &error64
+                    )
+                PyThread_release_lock(self.lock)
             err = error or error64
             if err!=0:
-                raise PardisoError("Memmory release error "+_err_messages[err])
+                raise PardisoError("Memory release error "+_err_messages[err])
+            for i in range(64):
+                self.handle[i] = NULL
+
+        if self.lock:
+            #dealloc lock
+            PyThread_free_lock(self.lock)
 
     cdef _analyze(self):
         #phase = 11
-        err = self._run_pardiso(11)
+        with nogil:
+            err = self._run_pardiso(11)
         if err!=0:
             raise PardisoError("Analysis step error, "+_err_messages[err])
 
@@ -516,9 +554,12 @@ cdef class MKLPardisoSolver:
         #phase = 22
         self._factored = False
 
-        err = self._run_pardiso(22)
+        with nogil:
+            err = self._run_pardiso(22)
+
         if err!=0:
             raise PardisoError("Factor step error, "+_err_messages[err])
+
         self._factored = True
 
     cdef _solve(self, void* b, void* x, int_t nrhs_in):
@@ -526,21 +567,26 @@ cdef class MKLPardisoSolver:
         if(not self._factored):
             raise PardisoError("Cannot solve without a previous factorization.")
 
-        err = self._run_pardiso(33, b, x, nrhs_in)
+        with nogil:
+            err = self._run_pardiso(33, b, x, nrhs_in)
+
         if err!=0:
             raise PardisoError("Solve step error, "+_err_messages[err])
 
-    cdef int _run_pardiso(self, int_t phase, void* b=NULL, void* x=NULL, int_t nrhs=0):
+    @cython.boundscheck(False)
+    cdef int _run_pardiso(self, int_t phase, void* b=NULL, void* x=NULL, int_t nrhs=0) noexcept nogil:
         cdef int_t error=0
         cdef long_t error64=0, phase64=phase, nrhs64=nrhs
 
+        PyThread_acquire_lock(self.lock, 1)
         if self._is_32:
             pardiso(self.handle, &self._par.maxfct, &self._par.mnum, &self._par.mtype,
                     &phase, &self._par.n, self.a, &self._par.ia[0], &self._par.ja[0],
                     &self._par.perm[0], &nrhs, self._par.iparm, &self._par.msglvl, b, x, &error)
-            return error
         else:
             pardiso_64(self.handle, &self._par64.maxfct, &self._par64.mnum, &self._par64.mtype,
                     &phase64, &self._par64.n, self.a, &self._par64.ia[0], &self._par64.ja[0],
                     &self._par64.perm[0], &nrhs64, self._par64.iparm, &self._par64.msglvl, b, x, &error64)
-            return error64
+        PyThread_release_lock(self.lock)
+        error = error or error64
+        return error
