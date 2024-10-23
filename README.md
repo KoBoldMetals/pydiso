@@ -6,6 +6,12 @@ to python, allowing the user to customize it as necessary for their use cases.
 
 # Installation
 
+## Installing with conda 
+
+```
+conda install pydiso --channel conda-forge
+```
+
 
 ## Installing from source
 
